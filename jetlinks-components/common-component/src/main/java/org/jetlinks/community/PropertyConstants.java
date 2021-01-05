@@ -12,6 +12,7 @@ import java.util.Optional;
  * @since 1.0
  */
 public interface PropertyConstants {
+    Key<String> orgId = Key.of("orgId");
 
     Key<String> deviceName = Key.of("deviceName");
 
@@ -24,6 +25,11 @@ public interface PropertyConstants {
     }
 
     interface Key<V> extends ConfigKey<V>, HeaderKey<V> {
+
+        @Override
+        default Class<V> getType() {
+            return ConfigKey.super.getType();
+        }
 
         static <T> Key<T> of(String key) {
             return new Key<T>() {

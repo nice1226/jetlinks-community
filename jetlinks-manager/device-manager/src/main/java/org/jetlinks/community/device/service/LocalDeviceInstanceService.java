@@ -4,46 +4,30 @@ import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.collections4.MapUtils;
-import org.hswebframework.ezorm.core.dsl.Query;
-import org.hswebframework.ezorm.core.param.TermType;
 import org.hswebframework.ezorm.rdb.mapping.ReactiveRepository;
 import org.hswebframework.ezorm.rdb.mapping.defaults.SaveResult;
-import org.hswebframework.web.api.crud.entity.PagerResult;
-import org.hswebframework.web.api.crud.entity.QueryParamEntity;
 import org.hswebframework.web.crud.service.GenericReactiveCrudService;
 import org.hswebframework.web.exception.BusinessException;
-import org.hswebframework.web.exception.NotFoundException;
 import org.hswebframework.web.id.IDGenerator;
 import org.jetlinks.community.device.entity.*;
 import org.jetlinks.community.device.enums.DeviceState;
 import org.jetlinks.community.device.response.DeviceDeployResult;
 import org.jetlinks.community.device.response.DeviceDetail;
-import org.jetlinks.community.device.response.DeviceInfo;
-import org.jetlinks.community.device.timeseries.DeviceTimeSeriesMetric;
-import org.jetlinks.community.gateway.annotation.Subscribe;
-import org.jetlinks.community.timeseries.TimeSeriesManager;
 import org.jetlinks.community.utils.ErrorUtils;
 import org.jetlinks.core.device.DeviceConfigKey;
 import org.jetlinks.core.device.DeviceOperator;
 import org.jetlinks.core.device.DeviceRegistry;
 import org.jetlinks.core.enums.ErrorCode;
-import org.jetlinks.core.event.EventBus;
-import org.jetlinks.core.event.Subscription;
 import org.jetlinks.core.exception.DeviceOperationException;
 import org.jetlinks.core.message.*;
 import org.jetlinks.core.message.function.FunctionInvokeMessageReply;
 import org.jetlinks.core.message.property.ReadPropertyMessageReply;
 import org.jetlinks.core.message.property.WritePropertyMessageReply;
-import org.jetlinks.core.metadata.DataType;
+import org.jetlinks.core.metadata.ConfigMetadata;
 import org.jetlinks.core.metadata.PropertyMetadata;
-import org.jetlinks.core.metadata.types.ObjectType;
 import org.jetlinks.core.metadata.types.StringType;
-import org.jetlinks.core.utils.FluxUtils;
 import org.reactivestreams.Publisher;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -51,30 +35,32 @@ import reactor.util.function.Tuple2;
 import reactor.util.function.Tuple3;
 import reactor.util.function.Tuples;
 
-import javax.annotation.PostConstruct;
-import java.time.Duration;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-
-import static org.jetlinks.community.device.timeseries.DeviceTimeSeriesMetric.devicePropertyMetric;
 
 @Service
 @Slf4j
 public class LocalDeviceInstanceService extends GenericReactiveCrudService<DeviceInstanceEntity, String> {
 
-    @Autowired
-    private DeviceRegistry registry;
+    private final DeviceRegistry registry;
 
-    @Autowired
-    private LocalDeviceProductService deviceProductService;
+    private final LocalDeviceProductService deviceProductService;
 
-    @Autowired
-    private EventBus eventBus;
+    private final DeviceConfigMetadataManager metadataManager;
 
-    @Autowired
     @SuppressWarnings("all")
-    private ReactiveRepository<DeviceTagEntity, String> tagRepository;
+    private final ReactiveRepository<DeviceTagEntity, String> tagRepository;
+
+    public LocalDeviceInstanceService(DeviceRegistry registry,
+                                      LocalDeviceProductService deviceProductService,
+                                      DeviceConfigMetadataManager metadataManager,
+                                      ReactiveRepository<DeviceTagEntity, String> tagRepository) {
+        this.registry = registry;
+        this.deviceProductService = deviceProductService;
+        this.metadataManager = metadataManager;
+        this.tagRepository = tagRepository;
+    }
 
 
     @Override
@@ -235,25 +221,34 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
                                                     List<DeviceTagEntity> tags) {
 
         DeviceDetail detail = new DeviceDetail().with(product).with(device).with(tags);
-
-        return registry
-            .getDevice(device.getId())
-            .flatMap(operator -> operator
-                //检查设备的真实状态,可能出现设备已经离线,但是数据库状态未及时更新的.
-                .checkState()
-                .map(DeviceState::of)
-                //检查失败,则返回原始状态
-                .onErrorReturn(device.getState())
-                //如果状态不一致,则需要更新数据库中的状态
-                .filter(state -> state != detail.getState())
-                .doOnNext(detail::setState)
-                .flatMap(state -> createUpdate()
-                    .set(DeviceInstanceEntity::getState, state)
-                    .where(DeviceInstanceEntity::getId, device.getId())
-                    .execute())
-                .thenReturn(operator))
+        return Mono
+            .zip(
+                //设备信息
+                registry
+                    .getDevice(device.getId())
+                    .flatMap(operator -> operator
+                        //检查设备的真实状态,可能出现设备已经离线,但是数据库状态未及时更新的.
+                        .checkState()
+                        .map(DeviceState::of)
+                        //检查失败,则返回原始状态
+                        .onErrorReturn(device.getState())
+                        //如果状态不一致,则需要更新数据库中的状态
+                        .filter(state -> state != detail.getState())
+                        .doOnNext(detail::setState)
+                        .flatMap(state -> createUpdate()
+                            .set(DeviceInstanceEntity::getState, state)
+                            .where(DeviceInstanceEntity::getId, device.getId())
+                            .execute())
+                        .thenReturn(operator)),
+                //配置定义
+                metadataManager
+                    .getDeviceConfigMetadata(device.getId())
+                    .flatMapIterable(ConfigMetadata::getProperties)
+                    .collectList(),
+                detail::with
+            )
             //填充详情信息
-            .flatMap(detail::with)
+            .flatMap(Function.identity())
             .switchIfEmpty(
                 Mono.defer(() -> {
                     //如果设备注册中心里没有设备信息,并且数据库里的状态不是未激活.
@@ -270,8 +265,7 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
             .onErrorResume(err -> {
                 log.warn("get device detail error", err);
                 return Mono.just(detail);
-            })
-            ;
+            });
 
     }
 
@@ -304,34 +298,6 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
             })
             .defaultIfEmpty(DeviceState.notActive);
     }
-
-    @PostConstruct
-    public void init() {
-
-        org.jetlinks.core.event.Subscription subscription = org.jetlinks.core.event.Subscription.of(
-            "device-state-synchronizer",
-            new String[]{
-                "/device/*/*/online",
-                "/device/*/*/offline"
-            },
-            Subscription.Feature.local
-        );
-
-        //订阅设备上下线消息,同步数据库中的设备状态,
-        //最小间隔800毫秒,最大缓冲数量500,最长间隔2秒.
-        //如果2条消息间隔大于0.8秒则不缓冲直接更新
-        //否则缓冲,数量超过500后批量更新
-        //无论缓冲区是否超过500条,都每2秒更新一次.
-        FluxUtils.bufferRate(eventBus
-                                 .subscribe(subscription, DeviceMessage.class)
-                                 .map(DeviceMessage::getDeviceId),
-                             800, Integer.getInteger("device.state.sync.batch", 500), Duration.ofSeconds(2))
-                 .publishOn(Schedulers.parallel())
-                 .concatMap(list -> syncStateBatch(Flux.just(list), false).map(List::size))
-                 .onErrorContinue((err, obj) -> log.error(err.getMessage(), err))
-                 .subscribe((i) -> log.info("同步设备状态成功:{}", i));
-    }
-
 
     public Flux<List<DeviceStateInfo>> syncStateBatch(Flux<List<String>> batch, boolean force) {
 
@@ -480,145 +446,6 @@ public class LocalDeviceInstanceService extends GenericReactiveCrudService<Devic
             )
             .flatMapMany(FunctionInvokeMessageSender::send)
             .flatMap(mapReply(FunctionInvokeMessageReply::getOutput));
-    }
-
-
-    @Subscribe("/device/*/*/register")
-    @Transactional(propagation = Propagation.NEVER)
-    public Mono<Void> autoRegisterDevice(DeviceRegisterMessage message) {
-        return registry
-            .getDevice(message.getDeviceId())
-            .switchIfEmpty(Mono.defer(() -> {
-                //自动注册
-                return doAutoRegister(message);
-            }))
-            .then();
-    }
-
-    private Mono<DeviceOperator> doAutoRegister(DeviceRegisterMessage message) {
-        //自动注册
-        return Mono
-            .zip(
-                //T1. 设备ID
-                Mono.justOrEmpty(message.getDeviceId()),
-                //T2. 设备名称
-                Mono.justOrEmpty(message.getHeader("deviceName")).map(String::valueOf),
-                //T3. 产品ID
-                Mono.justOrEmpty(message.getHeader("productId").map(String::valueOf)),
-                //T4. 产品
-                Mono.justOrEmpty(message.getHeader("productId").map(String::valueOf))
-                    .flatMap(deviceProductService::findById),
-                //T5. 配置信息
-                Mono.justOrEmpty(message.getHeader("configuration").map(Map.class::cast).orElse(new HashMap()))
-            ).flatMap(tps -> {
-                DeviceInstanceEntity instance = new DeviceInstanceEntity();
-                instance.setId(tps.getT1());
-                instance.setName(tps.getT2());
-                instance.setProductId(tps.getT3());
-                instance.setProductName(tps.getT4().getName());
-                instance.setConfiguration(tps.getT5());
-                instance.setRegistryTime(message.getTimestamp());
-                instance.setCreateTimeNow();
-                instance.setCreatorId(tps.getT4().getCreatorId());
-                instance.setOrgId(tps.getT4().getOrgId());
-                instance.setState(DeviceState.online);
-                return super
-                    .save(Mono.just(instance))
-                    .thenReturn(instance)
-                    .flatMap(device -> registry
-                        .register(device.toDeviceInfo().addConfig("state", DeviceState.online)));
-            });
-    }
-
-    /**
-     * 通过订阅子设备注册消息,自动绑定子设备到网关设备
-     *
-     * @param message 子设备消息
-     * @return void
-     */
-    @Subscribe("/device/*/*/message/children/*/register")
-    @Transactional(propagation = Propagation.NEVER)
-    public Mono<Void> autoBindChildrenDevice(ChildDeviceMessage message) {
-        String childId = message.getChildDeviceId();
-        Message childMessage = message.getChildDeviceMessage();
-        if (childMessage instanceof DeviceRegisterMessage) {
-
-            return registry
-                .getDevice(childId)
-                .switchIfEmpty(Mono.defer(() -> doAutoRegister(((DeviceRegisterMessage) childMessage))))
-                .flatMap(dev -> dev.setConfig(DeviceConfigKey.parentGatewayId, message.getDeviceId()).thenReturn(dev))
-                .flatMap(DeviceOperator::getState)
-                .flatMap(state -> this
-                    .createUpdate()
-                    .set(DeviceInstanceEntity::getParentId, message.getDeviceId())
-                    .set(DeviceInstanceEntity::getState, DeviceState.of(state))
-                    .where(DeviceInstanceEntity::getId, childId)
-                    .execute()
-                ).then();
-        }
-        return Mono.empty();
-    }
-
-    /**
-     * 通过订阅子设备注销消息,自动解绑子设备
-     *
-     * @param message 子设备消息
-     * @return void
-     */
-    @Subscribe("/device/*/*/message/children/*/unregister")
-    public Mono<Void> autoUnbindChildrenDevice(ChildDeviceMessage message) {
-        String childId = message.getChildDeviceId();
-        Message childMessage = message.getChildDeviceMessage();
-        if (childMessage instanceof DeviceUnRegisterMessage) {
-
-            return registry
-                .getDevice(childId)
-                .flatMap(dev -> dev
-                    .removeConfig(DeviceConfigKey.parentGatewayId.getKey())
-                    .then(dev.checkState()))
-                .flatMap(state -> createUpdate()
-                    .setNull(DeviceInstanceEntity::getParentId)
-                    .set(DeviceInstanceEntity::getState, DeviceState.of(state))
-                    .where(DeviceInstanceEntity::getId, childId)
-                    .execute()
-                    .then());
-
-
-        }
-        return Mono.empty();
-    }
-
-    //保存标签
-    @Subscribe("/device/*/*/message/tags/update")
-    public Mono<Void> updateDeviceTag(UpdateTagMessage message) {
-        Map<String, Object> tags = message.getTags();
-        String deviceId = message.getDeviceId();
-
-        return registry
-            .getDevice(deviceId)
-            .flatMap(DeviceOperator::getMetadata)
-            .flatMapMany(metadata -> Flux
-                .fromIterable(tags.entrySet())
-                .map(e -> {
-                    DeviceTagEntity tagEntity = metadata
-                        .getTag(e.getKey())
-                        .map(DeviceTagEntity::of)
-                        .orElseGet(() -> {
-                            DeviceTagEntity entity = new DeviceTagEntity();
-                            entity.setKey(e.getKey());
-                            entity.setType("string");
-                            entity.setName(e.getKey());
-                            entity.setCreateTime(new Date());
-                            entity.setDescription("设备上报");
-                            return entity;
-                        });
-                    tagEntity.setValue(String.valueOf(e.getValue()));
-                    tagEntity.setDeviceId(deviceId);
-                    tagEntity.setId(DeviceTagEntity.createTagId(deviceId, tagEntity.getKey()));
-                    return tagEntity;
-                }))
-            .as(tagRepository::save)
-            .then();
     }
 
 
